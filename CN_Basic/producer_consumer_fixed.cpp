@@ -37,7 +37,7 @@ public:
         std::unique_lock<std::mutex> lock(mtx);
         not_empty.wait(lock,[this](){
             return !queue_.empty() || stop_;
-        });
+        });//此处的语法：lambda表达式（事实上，只能访问大括号内的变量和全局变量）默认无法访问类内的成员变量，必须捕获this来把它的变量传进去
         if (stop_ && queue_.empty()) return false; //注意判定条件的不同，需要保证队列为空
         value = std::move(queue_.front()); //注意不用pop,用move把对应数据取出。
         queue_.pop();//记得把front弹出
