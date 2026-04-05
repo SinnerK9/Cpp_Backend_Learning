@@ -15,6 +15,7 @@ private:
     std::atomic<bool> stop;
     std::vector<std::thread> workers;  // 用vector容器来管理工作线程
     std::queue<std::function<void()>> tasks;  // 任务队列：存储待执行的函数
+    std::atomic<size_t> pending_tasks{0};//采用atomic原子操作，多线程安全加减
 
     // 新知识：这里的function<void()>相当于将所有可以调用的东西打包成一个统一类型
     // 这里面所有的任务都叫做task，用task()即可执行之
@@ -47,6 +48,7 @@ public:
                     }  // 离开作用域，自动解锁，在执行任务时已经解锁！这一点很重要，因为执行任务本身并不需要操作队列，所以可以让别的线程读取任务防止阻塞
                        //总而言之：锁只保护队列，无需保护任务执行  
                     task();
+                    pending_tasks--; //任务执行完毕后，提交但未执行完毕的数量减少
                 }
             });
         }
@@ -74,6 +76,7 @@ public:
             tasks.push([task](){
                 (*task)();
             });
+            pending_tasks++; //提交之后，未解决的任务数增加
         }
         condition.notify_one();
         return result;//debug:return必须在唤醒线程之后
@@ -86,7 +89,10 @@ public:
             stop = true;
         }
         condition.notify_all();
-
+        //增加判断逻辑，等待所有任务完成
+        while(pending_tasks > 0){
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         for(auto& worker : workers){
             if(worker.joinable()){
                 worker.join();
