@@ -7,17 +7,30 @@
 #include <thread>
 #include <vector>
 #include "Threadpool.h"
+#include <mutex> 
 
 using namespace std; 
-void Handle_Client(int client_socket,struct sockaddr_in client_addr){
-    cout << "Thread" << this_thread::get_id << "Client IP address: " << inet_ntoa(client_addr.sin_addr) << endl;
+std::mutex cout_mtx;
+void Handle_Client(int client_socket, struct sockaddr_in client_addr){
+    //加上 ()，正确获取线程 ID
+    {
+        std::lock_guard<std::mutex> lock(cout_mtx);
+        cout << "Thread " << this_thread::get_id() << " Client IP: " << inet_ntoa(client_addr.sin_addr) << endl;
+    }
+
     char buf[1000] = {0};
-    int byte_read = recv(client_socket,buf,sizeof(buf) -1, 0);
+    int byte_read = recv(client_socket, buf, sizeof(buf) -1, 0);
+    
     if(byte_read > 0) {
-        cout << "Thread " << this_thread::get_id() << " received: " << buf << endl;
+        {
+            std::lock_guard<std::mutex> lock(cout_mtx);
+            cout << "Thread " << this_thread::get_id() << " received: \n" << buf << endl;
+        }
+
         const char* response = "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: 19\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: 15\r\n"
+            "Connection: close\r\n" //关键修复：告诉浏览器发完就关连接
             "\r\n"
             "<h1>Hello!</h1>";
 
@@ -25,7 +38,11 @@ void Handle_Client(int client_socket,struct sockaddr_in client_addr){
     }
 
     close(client_socket);
-    cout << "Thread " << this_thread::get_id() << " finished handling client" << endl;
+    
+    {
+        std::lock_guard<std::mutex> lock(cout_mtx);
+        cout << "Thread " << this_thread::get_id() << " finished handling client" << endl;
+    }
 }
 
 int main() {
