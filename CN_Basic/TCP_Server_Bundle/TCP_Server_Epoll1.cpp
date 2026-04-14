@@ -7,9 +7,16 @@
 #include <sys/epoll.h>
 #include <fcntl.h> //优化1：用于设置非阻塞的头文件
 #include <errno.h>
+#include <signal.h> //优化4：用于设置忽略SIGPIPE逻辑 
 
 using namespace std; 
 
+//优化：新增一个结构体：全局大数组记录断续传来的数据并组合在一起，防止局部数组导致的丢数据
+struct ClientState {
+    int fd;
+    std::string buffer;//用string记录数据，方便断续传来的数据组合起来
+};
+ClientState users[65536];
 
 //新增函数：setnonblocking用于给描述符fd加上非阻塞属性！
 int setnonblocking(int fd){
@@ -20,6 +27,7 @@ int setnonblocking(int fd){
 }
 
 int main() {
+    signal(SIGPIPE, SIG_IGN); //设置忽略SIGPIPE
     int listenfd = socket(PF_INET, SOCK_STREAM, 0);
     if (listenfd < 0) {
         perror("Socket Error!");
@@ -57,7 +65,7 @@ int main() {
     }
 
     struct epoll_event ev;
-    ev.events = EPOLLIN; 
+    ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP; //LT->ET:规定电平触发（位或运算）
     ev.data.fd = listenfd; 
 
     if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,listenfd,&ev) < 0){
@@ -77,6 +85,14 @@ int main() {
 
         for(int i = 0; i < n; i++){
             int curr_fd = events[i].data.fd; 
+            //优化：在处理前增加对EPOLLRDHUP | EPOLLHUP | EPOLLERR等其他异常标志的检测，并对异常连接进行安全关闭
+            //通过位运算，检测event中是否存在这三异常个事件中的其中一个
+            if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                cout << "fd: " << curr_fd << " 异常断开，已清理" << endl;
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, NULL);  //从事件表中删除
+                close(curr_fd); //直接关闭异常文件描述符                                
+                continue; //跳过后续逻辑                                       
+            }
 
             if(curr_fd == listenfd){
                 while(true){ //优化2：为了解决单次accept有大量连接积压导致超时和重复wait的问题，accept进入死循环直到后面没有连接
@@ -90,10 +106,12 @@ int main() {
                         break;
                     }
                     setnonblocking(client_fd);//优化1：将client_fd设为非阻塞
+                    users[client_fd].fd = client_fd; //优化：每接收一个新连接，把它丢进全局大数组
+                    users[client_fd].buffer = ""; //接收到的数据初始化为空
                     std::cout << "新连接：" << client_fd << std::endl;
                     std::cout << "新连接IP:" << inet_ntoa(client_addr.sin_addr) << std::endl;
                     struct epoll_event client_ev;
-                    client_ev.events = EPOLLIN;
+                    client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP; //优化3：LT->ET:规定电平触发 + 监听客户端断开
                     client_ev.data.fd = client_fd;
                     if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0){
                         perror("epoll_ctl: client_fd");
@@ -105,18 +123,28 @@ int main() {
                     char buf[1024] = {0};
                     int byte_read = recv(curr_fd,buf,sizeof(buf)-1,0);
                     if(byte_read > 0){
-                        std::cout << "fd: " << curr_fd << "received: " << buf << std::endl;
-                        const char* response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>Hello from epoll server!</h1>";
-                        send(curr_fd, response, strlen(response), 0);
+                        users[curr_fd].buffer += buf; //不马上响应，先把这段丢进接收到的数据再说
                     }else if(byte_read == 0){
                         cout << "fd: " << curr_fd << "断开连接" << endl;
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, NULL);
                         close(curr_fd);
+                        users[curr_fd].buffer.clear(); //清空数据
+                        break;
                     }else if(byte_read < 0){
-                        if(errno == EAGAIN||errno == EWOULDBLOCK) break; //数据读完了，跳出循环
+                        if(errno == EAGAIN||errno == EWOULDBLOCK){
+                            //这会数据真全读完了，现在的buffer存的确实是所有数据，可以回复了
+                            if(!users[curr_fd].buffer.empty()){
+                                std::cout << "fd " << curr_fd << " 的完整请求内容: \n" << users[curr_fd].buffer << endl;
+                                const char* response = "HTTP/1.1 200 OK\r\n\r\n<h1>Hello</h1>";
+                                send(curr_fd, response, strlen(response), 0);
+                                users[curr_fd].buffer.clear(); //要清空这个fd的数据
+                            }
+                            break;
+                        } //数据读完了，跳出循环
                         perror("recv");
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, NULL);
                         close(curr_fd); //真出错了，关闭连接
+                        users[curr_fd].buffer.clear();
                         break;
                     }
                 }

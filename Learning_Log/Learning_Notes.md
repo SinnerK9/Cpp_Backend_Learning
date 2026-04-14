@@ -406,7 +406,7 @@ epoll：内核不遍历，仅维护就绪队列，用户态只遍历就绪 socke
 select：主动轮询，每次调用全遍历，大量无效操作。
 epoll：事件驱动，socket 有数据主动上报，仅处理有效事件。
 
-## 2026.4.13 Epoll服务器缺陷分析与后续优化
+## 2026.4.13-4.14 Epoll服务器缺陷分析与后续优化
 ### 代码缺陷大观
 目前的基础Epoll服务器，距离工业可用仍有相当距离。参考原项目的解析文档，我梳理出一下的缺陷。
 
@@ -414,7 +414,7 @@ epoll：事件驱动，socket 有数据主动上报，仅处理有效事件。
 代码现象：accept 和 recv 均操作默认的阻塞型文件描述符（fd）。
 核心缺陷：虽然在 LT 模式下，epoll_wait 唤醒能保证“必定有连接”或“必定有数据”，不会发生传统阻塞模型中的“死等”。但是，如果遇到恶意的或网络极差的“慢客户端”，recv 仍会因等待读满预期数据而耗费大量时间。
 最终后果：由于是单线程同步执行，主线程一旦被某一个慢连接的 recv 绊住，整个事件循环就会停滞。所有其他客户端的并发请求均被堵塞，造成“一个慢请求拖死整个服务器”的雪崩效应。
-#### LT (水平触发) 模式引发的系统调用风暴
+#### LT模式引发的大量系统调用和不必要上下文切换开销
 代码现象：事件注册为 ev.events = EPOLLIN;（默认 LT 模式）。
 核心缺陷：LT 模式的语义是“只要缓冲区还有数据，就会一直通知”。假设客户端发送了 2000 字节，而服务器 recv 的单次接收上限是 1024 字节。第一轮读取后剩余 976 字节，内核会立刻再次唤醒 epoll_wait，强制要求主线程继续读取。
 最终后果：在高并发大流量场景下，未能一次性读完的数据会导致epoll_wait被频繁、重复地触发。这会产生海量的内核态与用户态之间的上下文切换开销，导致 CPU 负载飙升，吞吐量骤降。
@@ -429,10 +429,10 @@ epoll：事件驱动，socket 有数据主动上报，仅处理有效事件。
 #### 异常连接状态监听缺失 (FD 泄漏隐患)
 代码现象：仅监听了基础的读事件，未注册 EPOLLRDHUP、EPOLLERR 等异常标志位。
 核心缺陷：网络环境极其复杂，客户端随时可能发生断电、断网或直接杀死进程等非优雅断开（RST 包）的情况。
-最终后果：服务器由于未监听这些异常事件，无法第一时间感知客户端的断开，相关的 socket 描述符无法被及时 close() 释放。随着时间推移，服务器会积累大量处于 CLOSE_WAIT 状态的死连接（FD 泄漏），最终因耗尽系统的文件描述符配额而崩溃。
-#### 缺失 SIGPIPE 信号免疫 (致命的进程异常退出)
-代码现象：服务器直接对客户端 socket 调用 send，未考虑连接的实时存活状态。
-核心缺陷：在 TCP 协议栈中，如果客户端已经关闭了读取端（发送了 FIN），而服务器仍尝试向其发送响应数据，第二次 write/send 操作会引发内核向进程发送 SIGPIPE 信号。
+最终后果：服务器由于未监听这些异常事件，无法第一时间感知客户端的断开，相关的 socket 描述符无法被及时close()释放。随着时间推移，服务器会积累大量处于 CLOSE_WAIT 状态的死连接（FD 泄漏），最终因耗尽系统的文件描述符配额而崩溃。
+#### 客户端自行断连产生SIGPIPE信号，导致进程异常退出
+代码现象：服务器直接对客户端socket调用send，未考虑连接的实时存活状态。
+核心缺陷：在 TCP 协议栈中，如果客户端已经关闭了读取端（发送了FIN），而服务器仍尝试向其发送响应数据，第二次 write/send 操作会引发内核向进程发送 SIGPIPE信号。
 最终后果：在 Linux 系统中，SIGPIPE 信号的默认动作是直接终止进程。这会导致服务器在没有任何报错日志的情况下突然崩溃退出，完全丧失鲁棒性。
 #### 单次 Accept 导致的连接堆积延迟
 代码现象：if(curr_fd == listenfd) 分支中，仅调用了一次 accept。
@@ -454,7 +454,66 @@ int setnonblocking(int fd) {
     //返回旧属性
     return old_option;
 }
-对listenfd和clientfd设置NONBLOCKING之后，它们的行为模式产生巨大变化：从没有数据就卡死等待，到如果数据没有准备好，就立刻返回-1并把errno（linux的全局错误码变量）设置为EAGAIN（专属于非阻塞IO的错误符，代表当前没有连接或数据，而非出现故障需要关闭socket）.
+对clientfd设置NONBLOCKING之后，它们的行为模式产生巨大变化：从没有数据就卡死等待，到如果数据没有准备好，就立刻返回-1并把errno（linux的全局错误码变量）设置为EAGAIN（专属于非阻塞IO的错误符，代表当前没有连接或数据，而非出现故障需要关闭socket）.
+
+**为什么listenfd也需要设置非阻塞？**：既然LT模式保证了没有连接的情况下不会触发epoll_wait，为什么listenfd依旧需要设置非阻塞？除了支持循环读写之外，它还有另外一层作用：客户端完成三次握手后触发epoll_wait，**但是epoll_wait无法保证listenfd去accept的时候连接仍然正常可连**，因为在这个通知过程中，可能出现**客户端异常取消**的情况，这会使得阻塞IO无法接受连接，从而原地阻塞。
 
 #### 循环读写
 给accept和recv都加上while(true)的死循环，直到errno == EAGAIN判断不再有数据和连接后再跳出等待下一次epoll_wait，解决了原来高并发情况下单次accept效率过低导致大量连接堆积超时，反复激发epoll_wait浪费系统资源的问题；以及一次epoll_wait仅有单次recv导致分片接收的数据无法整合成完整数据的问题。
+
+**非阻塞IO的改动是循环读写可用的前置必要条件**：设想阻塞IO配合循环读写，一次循环中读完所有数据和连接之后的最后一次请求会因为读不到数据和连接而阻塞在原地。
+
+#### LT->ET
+在设置了非阻塞IO和循环读写之后，我们可以将LT模式改为ET模式，出现状态变化再调用epoll_wait，利用循环读写一次性读完所有数据/accept完所有连接，而不必用LT模式反复触发epoll_wait带来额外的不必要上下文转换开销。
+ev.events = EPOLLIN | EPOLLET; 
+client_ev.events = EPOLLIN | EPOLLET; 
+利用位或运算修改内核规则，规定只有状态发生变化时才触发一次。
+
+#### 增加对SIGPIPE信号的忽略逻辑 + 提前监听客户端提前断开事件EPOLLRDHUP
+引入signal.h，在主函数里增加 signal(SIGPIPE, SIG_IGN); //设置忽略SIGPIPE
+可以有效解决send时发现客户端断连，无效write产生SIGPIPE导致的关闭。
+client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+TCP对端主动关闭连接发送FIN会产生事件标志EPOLLRDHUP，监听之可以提前直到对方已关连
+
+#### 增加对EPOLLHUP | EPOLLERR等其他复杂情况的判断
+及时感知其他复杂网络环境导致的异常情况，必须在处理fd之前先确定是否存在EPOLLRDHUP（单侧断连，和前述优化的情况触发时机不同）| EPOLLHUP（双侧断连）| EPOLLERR（连接错误：断网崩溃超时等）等异常情况，一旦出现，后续不会再触发EPOLLIN/EPOLLOUT（可读/可写）。应当先做判断，确定无异常再再对fd进行针对性处理（accept/recv）。因此在读取fd后，先进行如下判断：
+//用位运算确定是否有异常标志
+if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+    cout << "fd: " << curr_fd << " 异常断开，已清理" << endl;
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, NULL);  
+    close(curr_fd);                                    
+    continue;                                        
+}
+
+#### 新增一个结构体：全局大数组内有string形式缓冲区记录断续传来的数据并组合在一起，防止局部数组导致的丢数据
+struct ClientState {
+    int fd;
+    std::string buffer;
+};
+ClientState users[65536];
+
+找到一个新的客户端连接，先把它丢进全局大数组，此时没有recv，接收到的数据初始化为空
+users[client_fd].fd = client_fd; 
+users[client_fd].buffer = "";
+
+每次recv，把连接读取到string中，让它自动扩容把新内容加上，确定读完前不send
+char buf[1024] = {0};
+int byte_read = recv(curr_fd,buf,sizeof(buf)-1,0);
+if(byte_read > 0)
+users[curr_fd].buffer += buf;
+
+确定读完后，得到的buffer就是所有数据，可以回应了
+else if(byte_read < 0)
+if(errno == EAGAIN||errno == EWOULDBLOCK){
+if(!users[curr_fd].buffer.empty()){
+std::cout << "fd " << curr_fd << " 的完整请求内容: \n" << users[curr_fd].buffer << endl;
+const char* response = "HTTP/1.1 200 OK\r\n\r\n<h1>Hello</h1>";
+send(curr_fd, response, strlen(response), 0);
+users[curr_fd].buffer.clear();
+    }
+break;
+}
+
+记得给每次退出增加清空buffer环节！
+
+#### 多线程优化与线程池接入：涉及大面积重构，明天再干！
