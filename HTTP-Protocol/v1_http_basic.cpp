@@ -18,6 +18,8 @@
 #include <future>
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
 
 using namespace std; 
 
@@ -134,16 +136,21 @@ void handle_client(int fd,int epoll_fd){
         send(fd,body.c_str(),body.size(),0);
     }else{
         std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(file_stat.st_size) + "\r\n\r\n"; //stat返回=0，找到了
-        send(fd,header.c_str(),header.size(),0); //先发头
         int src_fd = open(filepath.c_str(),O_RDONLY); //READ_ONLY打开
+        //进行内存映射。传入参数：映射虚拟内存地址（NULL自动分配），映射内存长度，映射权限（只读），映射类型（私有映射），映射的文件描述符，文件偏移量（0表示开头开始映射）
+        //返回值是映射后的内存首地址，直接靠这个地址即可访问文件
+        char* file_address = (char*) mmap(NULL,file_stat.st_size,PROT_READ,MAP_PRIVATE,src_fd,0);
+        close(src_fd); //mmap建立后不需要文件描述符了，关掉释放资源
 
-        char file_buf[1024]; //设置缓冲区大小为1KB
-        int bytes_read;
-        //反复读文件，一次读1KB并传送过去
-        while((bytes_read = read(src_fd,file_buf,sizeof(file_buf))) > 0){
-            send(fd,file_buf,bytes_read,0);
-        }
-        close(src_fd);
+        //writev专用的数据块描述结构体，描述不连续内存，包含内存首地址和数据长度
+        struct iovec iv[2];
+        iv[0].iov_base = (void*)header.c_str(); //第一块内存：响应头
+        iv[0].iov_len = header.size();
+        iv[1].iov_base = file_address; //第二块内存：mmap出的内容
+        iv[1].iov_len = file_stat.st_size;
+
+        writev(fd,iv,2); //聚合写：传入客户端socket描述符，iovec数组和要传送的数据块数量
+        munmap(file_address, file_stat.st_size); //解除映射，释放资源
     }
     //清空buffer，重置EPOLLONESHOT
     users[fd].buffer.clear(); 
