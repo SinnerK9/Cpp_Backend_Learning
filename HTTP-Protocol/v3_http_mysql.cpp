@@ -175,14 +175,11 @@ HTTP_CODE parse_http_request(ClientState& client){
                     client.check_state = CHECK_STATE_CONTENT;
                     break;
                 }
-                //开始解析具体的词条!
-                //是否connection词条？是否长连接？
                 if(line.find("Connection:") != std::string::npos){
                     if(line.find("keep-alive") != std::string::npos){
                         client.keep_alive = true;
                     }
                 }
-                //解析请求体长度
                 if(line.find("Content-Length:")!= std::string::npos){
                     client.content_length = std::stoi(line.substr(15)); //请求体长度：Content-Length:后面的子字符串转为数字
                 }
@@ -205,7 +202,7 @@ HTTP_CODE parse_http_request(ClientState& client){
 //HOST报文这部分的形式是固定的：user=admin&password=123456
 bool parse_post_data(ClientState& client,std::string& username,std::string& password){
     size_t user_pos = client.post_data.find("user=");
-    size_t pwd_pos = client.post_data.find("&password:");
+    size_t pwd_pos = client.post_data.find("&password=");
     if(user_pos == std::string::npos || pwd_pos == std::string::npos){
         return false;
     }
@@ -240,12 +237,23 @@ bool check_login(const std::string& user, const std::string& password){
 void send_login_response(int fd,bool success){
     std::string html;
     if(success){
-        html = "<html><body><h1>✅ 登录成功！欢迎回来</h1></body></html>";
+        html = html = "<html><head><meta charset='UTF-8'></head>"
+               "<body style='text-align:center; padding-top:100px; font-family:Arial;'>"
+               "<h1 style='color:green;'>✅ 登录成功！账号密码完全正确！</h1>"
+               "<p>MySQL 数据库验证通过！</p>"
+               "<a href='/index.html' style='font-size:20px;'>🔙 返回首页</a>" 
+               "</body></html>";
     }else{
-        html = "<html><body><h1>❌ 登录失败！账号或密码错误</h1></body></html>";
+        html = "<html><head><meta charset='UTF-8'></head>"
+               "<body style='text-align:center; padding-top:100px; font-family:Arial;'>"
+               "<h1 style='color:red;'>❌ 登录失败！</h1>"
+               "<p>账号或密码与 MySQL 数据库不匹配，请重试。</p>"
+               "<a href='/login.html' style='font-size:20px;'>🔄 重新登录</a>"
+               "</body></html>";
     }
 
     std::string header = "HTTP/1.1 200 OK\r\n";
+    header += "Content-Type: text/html; charset=utf-8\r\n";
     header += "Content-length:" + std::to_string(html.size()) + "\r\n";
     header += "Connection:keep-alive\r\n\r\n";
     send(fd,(header + html).c_str(),header.size() + html.size(),0);
@@ -277,41 +285,53 @@ void handle_client(int fd,int epoll_fd){
         return;
     }else if(ret == GET_REQUEST){
         std::cout << "方法为： " << client.method << "  路径为： " << client.url << " 版本为： " << client.version << " 长连接： " << client.keep_alive << std::endl;
-        if(client.url == "/"){
-            client.url = "/index.html"; 
-        }
-        std::string filepath = "./resources" + client.url; 
-        struct stat file_stat;
-        if(stat(filepath.c_str(),&file_stat) < 0){
-            std::string body = "<h1>404 Not Found</h1>";
-            std::string header = "HTTP/1.1 404 Not Found\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-            send(fd,header.c_str(),header.size(),0); 
-            send(fd,body.c_str(),body.size(),0);
+        if(client.method == "POST" && client.url == "/login"){
+            std::string user;
+            std::string password;
+            bool if_parse = parse_post_data(client,user,password);
+            std::cout << "1. post_data长度: " << client.post_data.size() << std::endl;
+            std::cout << "2. post_data内容: [" << client.post_data << "]" << std::endl;
+            std::cout << "3. 账号: [" << user << "]" << std::endl;
+            std::cout << "4. 密码: [" << password << "]" << std::endl;
+            bool if_login = if_parse ? check_login(user, password) : false;
+            send_login_response(fd,if_login);
         }else{
-            std::string header = "HTTP/1.1 200 OK\r\n";
-            //是否为长连接？将这部分信息在响应头中传出去
-            if(client.keep_alive == true){
-                header +=  "Connection: keep-alive\r\n";
+            if(client.url == "/"){
+                client.url = "/index.html"; 
+            }
+            std::string filepath = "./resources" + client.url; 
+            struct stat file_stat;
+            if(stat(filepath.c_str(),&file_stat) < 0){
+                std::string body = "<h1>404 Not Found</h1>";
+                std::string header = "HTTP/1.1 404 Not Found\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+                send(fd,header.c_str(),header.size(),0); 
+                send(fd,body.c_str(),body.size(),0);
             }else{
-                header += "Connection: close\r\n";
+                std::string header = "HTTP/1.1 200 OK\r\n";
+                if(client.keep_alive == true){
+                    header +=  "Connection: keep-alive\r\n";
+                }else{
+                    header += "Connection: close\r\n";
+                }
+                if(client.url.find(".jpg") != std::string::npos || client.url.find(".png") != std::string::npos) {
+                    header += "Content-Type: image/jpeg\r\n"; // 图片类型
+                } else {
+                    header += "Content-Type: text/html; charset=utf-8\r\n"; // 网页类型
+                }
+                header += "Content-Length: "+ std::to_string(file_stat.st_size) + "\r\n\r\n"; //stat返回=0，找到了
+                int src_fd = open(filepath.c_str(),O_RDONLY); 
+                char* file_address = (char*) mmap(NULL,file_stat.st_size,PROT_READ,MAP_PRIVATE,src_fd,0);
+                close(src_fd); 
+                struct iovec iv[2];
+                iv[0].iov_base = (void*)header.c_str(); 
+                iv[0].iov_len = header.size();
+                iv[1].iov_base = file_address;
+                iv[1].iov_len = file_stat.st_size;
+                writev(fd,iv,2); 
+                munmap(file_address, file_stat.st_size); 
             }
-            if(client.url.find(".jpg") != std::string::npos || client.url.find(".png") != std::string::npos) {
-                header += "Content-Type: image/jpeg\r\n"; // 图片类型
-            } else {
-                header += "Content-Type: text/html; charset=utf-8\r\n"; // 网页类型
-            }
-            header += "Content-Length: "+ std::to_string(file_stat.st_size) + "\r\n\r\n"; //stat返回=0，找到了
-            int src_fd = open(filepath.c_str(),O_RDONLY); 
-            char* file_address = (char*) mmap(NULL,file_stat.st_size,PROT_READ,MAP_PRIVATE,src_fd,0);
-            close(src_fd); 
-            struct iovec iv[2];
-            iv[0].iov_base = (void*)header.c_str(); 
-            iv[0].iov_len = header.size();
-            iv[1].iov_base = file_address;
-            iv[1].iov_len = file_stat.st_size;
-            writev(fd,iv,2); 
-            munmap(file_address, file_stat.st_size); 
         }
+        
         if(client.keep_alive){
             client.init(fd);
             struct epoll_event ev;
@@ -327,7 +347,7 @@ void handle_client(int fd,int epoll_fd){
 }
 
 int main() {
-
+    MySQLPool::get_instance();//新增：先初始化连接池
     signal(SIGPIPE, SIG_IGN); 
     threadpool pool(8);
     int listenfd = socket(PF_INET, SOCK_STREAM, 0);

@@ -58,13 +58,18 @@
         <img src="/test.jpg" alt="测试图片">
     </div>
 
-    <div class="tip">
-        <strong>🔍 终端观察指南：</strong><br>
-        现在请去看看你运行 C++ 服务器的终端！<br>
-        你应该会看到同一个文件描述符 (fd) 连续输出了两条日志：<br>
-        1. 方法:GET 路径:<code>/index.html</code> 协议:HTTP/1.1 长连接:1<br>
-        2. 方法:GET 路径:<code>/test.jpg</code> 协议:HTTP/1.1 长连接:1<br>
-        <em>这就是 HTTP/1.1 Keep-Alive 带来的网络复用魔法！</em>
+    <!-- 这是新增的通道：把用户引向登录页面 -->
+    <div style="margin-top: 40px;">
+        <p>想体验和 MySQL 数据库的动态交互吗？</p>
+        <a href="/login.html" style="
+            display: inline-block;
+            padding: 10px 20px;
+            background-color: #27ae60;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            font-size: 18px;
+        ">👉 点击这里进入登录测试页</a>
     </div>
 </body>
 </html>

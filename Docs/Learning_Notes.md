@@ -801,4 +801,78 @@ if(client.url.find(".jpg") != std::string::npos || client.url.find(".png") != st
 优化之后，网页可以显示指定的照片test.jpg了！
 4：在观察终端过程中，发现有额外请求favicon.ico，查询资料后发现这是网页图标的请求，因此增加了一个图标文件，并且学习了如何禁用网页缓存。
 
-## 2026.4.22 集成MySQL实现账号注册登录
+## 2026.4.22-4.23 集成MySQL实现账号注册登录
+
+### MySQL准备和连接池构建
+在此基础上，可以集成MySQL库实现账号注册登录的功能了。在linux上安装好MySQL服务并登录后，创建webserver库并授权本地C++连接，创建测试账号密码，完成C++调用MySQL API的前置准备。
+首先我们明确，账号密码存储在MySQL库webserver数据库的user表内，每次查询需要创建MySQL连接，并且通过连接查询库中存不存在响应的账号密码。与线程池类似地，如果每一次查询数据库内容都需要新建MySQL连接，会严重影响性能，因此我们需要创建一个MySQL连接池，连接池内包含基础的构造函数，创建MySQL连接和归还连接函数。
+值得注意的是：**MySQL连接池不能随意创建，全局只能存在一个连接池**，由于这个原因，连接池的构造函数是私有的，外界只能获取单例来访问唯一的连接池，向其请求连接。
+'''
+static MySQLPool* get_instance() {
+        if (!instance) instance = new MySQLPool();
+        return instance;
+    }
+'''
+instance是连接池池内预先构造的静态连接池指针，指向唯一一个连接池。如果在调用该函数的时候还没有创建，就会自动创建一个实例。通过理解这种方式，我学会了单例模式的构造方法。
+
+### 增加POST解析
+在前面的服务器代码中，我们并没有面向请求体的解析。现在的登录功能要求我们接收POST模式发来的报文中含有的账号密码信息，因此我们需要在ClientState结构体中增加一个post_data的string来存储客户端发来的内容，并且新增POST的解析函数。由于发来的POST内容形式固定形如user=admin&password=123456，可以轻松得到解析方法如下：
+'''
+bool parse_post_data(ClientState& client,std::string& username,std::string& password){
+    size_t user_pos = client.post_data.find("user=");
+    size_t pwd_pos = client.post_data.find("&password:");
+    if(user_pos == std::string::npos || pwd_pos == std::string::npos){
+        return false;
+    }
+    username = client.post_data.substr(user_pos + 5,pwd_pos - (user_pos + 5));
+    password = client.post_data.substr(pwd_pos + 10);
+    return true;
+}
+'''
+
+### 数据库连接校验与动态响应
+解析出POST报文中含有的账号密码后，我们需要将其传入数据库进行比对，决定能否登录，并且对不同的结果做出动态响应，而不是无论什么情况都发送一个静态的文件。
+'''
+bool check_login(const std::string& user, const std::string& password){
+    MySQLPool* pool = MySQLPool::get_instance();
+    MYSQL* conn = pool->get_conn();
+    if(conn == NULL){
+        return false;
+    }
+    char sql[1024];
+    sprintf(sql,"SELECT * FROM user WHERE username='%s' AND password='%s'",user.c_str(),password.c_str());
+    if(mysql_query(conn,sql)){
+        pool->return_conn(conn);
+        return false; 
+    }
+    MYSQL_RES* res = mysql_store_result(conn);
+    bool success = mysql_num_rows(res) > 0; 
+    mysql_free_result(res);
+    pool->return_conn(conn);
+    return success;
+}
+'''
+在代码中，我们用到大量MySQL的关键API：在将输出的账号密码转化为数据库的查询语句后，调用mysql_query()，通过连接执行传入的SQL语句，传入参数为连接和语句，返回值为0表示成功，非0失败。
+再调用储存查询结果集的mysql_store_result，传入连接，传出一个指向结果集结构体的指针res，包含查询到的所有行数据，对其进行mysql_num_rows(res)判断，得到查询结果的行数，查询出的结果行数大于0则说明数据库中有相应的账号密码。
+
+视查询结果不同，我们有两种不同的响应如下：
+if(success){
+        html = "<html><body><h1>✅ 登录成功！欢迎回来</h1></body></html>";
+    }else{
+        html = "<html><body><h1>❌ 登录失败！账号不存在或密码错误</h1></body></html>";
+    }
+将其和响应头一同发送即可！
+
+### 完善主状态机和POST登录逻辑
+现在我们终于可以对POST类报文的请求体进行解析了！
+在主状态机的case CHECK_STATE_CONTENT中，判断buffer中的剩余空间大于请求体的大小后，将请求体部分存入post_data。
+返回我们真正用于处理连接的handle_client函数，确定请求完整的情况下，我们需要增加对POST请求的处理逻辑。在解析请求行的时候，区分开GET类和POST类,确定为POST请求且请求路径为专门的/login页面后，进入处理逻辑：先进行报文解析得到用户名和密码，再在数据库中查询对应词条，根据查询结果发送对应响应。
+'''
+if(client.method == "POST" && client.url == "/login"){
+            std::string user;
+            std::string password;
+            bool if_parse = parse_post_data(client,user,password);
+            bool if_login = check_login(user,password);
+            send_login_response(fd,if_login);
+        }
+'''
