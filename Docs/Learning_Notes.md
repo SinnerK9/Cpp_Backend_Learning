@@ -877,7 +877,7 @@ if(client.method == "POST" && client.url == "/login"){
         }
 '''
 
-## 2026.4.24-4.26 架构重构
+## 2026.4.26 架构重构：MySQL_Pool & Thread_Pool
 到目前为止我们可以说基本实现了这个服务器的架构，但是观察现在的代码，几乎所有的代码都集成在一个cpp中，暴露出大量的底层系统调用，这严重影响了代码的可读性和可维护性！理想的工程代码应当是结构化的，模块化的。在这个思想的指导下，我们需要将整个代码进行重构。
 先对最显著的两个单独模块进行重构：MySQLPool和ThreadPool。
 
@@ -1007,3 +1007,96 @@ size_t thread_count() const {
 }
 '''
 有利于查询线程池目前积压了多少任务，对后续的开发有帮助。
+
+## 2026.4.27 架构重构： Webserver & Epoller & HttpConn
+这三部分是现有代码最关键的部分：这种分法是我借助AI进一步分析架构的时候得到的拆分方法，和TinyWebserver的架构哲学相差甚远，模块化工程化也要彻底的多。
+在Webserver/Epoller/HttpConn的分类方式里，每个部分各司其职：
+Epoller：该模块集成了Epoll的功能，也就只需要完成它的任务：即监测新的连接，以及现有的连接是否有请求。
+HttpConn：检测到请求后，轮到HttpConn执行任务：客户端发的是什么请求？说了什么？是哪一类？服务器应该做什么样的相应？是要登录还是要访问静态的网页？
+Webserver：所有模块的工作都交给它管理，Webserver掌握了Threadpool/Epoller/HttpConn users[]的信息，指挥其工作，作为调度中心而存在。
+简单地说：谁持有数据，就负责什么工作。
+
+### Epoller类
+要封装Epoller类，要从原来的服务器代码中找到Epoll掌管的部分：
+注册fd(listenfd/client_fd)，将fd放入内核监听事件表，再对其Epoll事件的状态进行增删改查，所有的操作都基于Epoll_create1()产生的指向内核事件表的**epoll_fd**，所以我们可以反过来说，凡是事关epoll_fd的，都应该由Epoller来处理。
+
+#### 构造函数
+一个Epoller只有两个私有成员变量：对应内核注册事件表的epoll_fd_和存储一次epoll_wait返回事件的数组events_。由此我们得到它的构造函数和析构函数定义：
+'''
+Epoller::Epoller(int max_events)
+    : epoll_fd_(epoll_create1(0))
+    , events_(max_events)
+{
+    if (epoll_fd_ < 0) {
+        perror("Epoller: epoll_create1 failed");
+        throw std::runtime_error("Epoller initialization failed");
+    }
+}
+Epoller::~Epoller() {
+    if (epoll_fd_ >= 0) {
+        close(epoll_fd_);
+    }
+}
+'''
+优化：用动态数组vector管理事件数组，保证了内存安全，解放了原本最多1024个事件响应的限制
+
+#### ADD/MOD/DEL：对epoll注册事件表的三类操作
+**bool add_fd(int fd, uint32_t events)**
+对应原代码中把fd纳入监听的注册代码：
+'''
+struct epoll_event ev;
+ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+ev.data.fd = listenfd;
+epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listenfd, &ev);
+// 注册 client_fd
+struct epoll_event client_ev;
+client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
+client_ev.data.fd = client_fd;
+epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
+'''
+
+仿照这个逻辑，构造一个函数Epoller::add_fd(int fd,uint32_t events)专门进行fd注册
+'''
+bool Epoller::add_fd(int fd, uint32_t events) {
+    struct epoll_event ev;
+    ev.data.fd = fd;
+    ev.events  = events;
+    return epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == 0;
+}
+'''
+
+**bool mod_fd(int fd, uint32_t events);**
+原代码中，有很多情况需要更改事件表中fd的监听事件，常常用于重置EPOLLONESHOT。将所有包含EPOLL_CTL_MOD逻辑的封装到mod_fd。
+'''
+bool Epoller::mod_fd(int fd, uint32_t events) {
+    struct epoll_event ev;
+    ev.data.fd = fd;
+    ev.events  = events;
+    return epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == 0;
+}
+'''
+
+**bool del_fd(int fd);**
+显然，连接断开了，将该fd对应的事件从红黑树中除去。
+bool Epoller::del_fd(int fd) {
+    return epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) == 0;
+}
+
+#### wait(int timeout_ms)：内核监听是否有事件？
+'''
+int Epoller::wait(int timeout_ms) {
+    int n = epoll_wait(epoll_fd_,events_.data(),static_cast<int>(events_.size()),timeout_ms);
+    if (n < 0 && errno != EINTR) {
+        perror("Epoller: epoll_wait failed");
+    }
+    return n;
+}
+'''
+相比原来代码简单的epoll_wait，一旦被打断即跳过的简易逻辑，wait函数进行了优化：考虑被信号打断的情况(errno == EINTR)，这类错误不是真正的错误，可能被定时器/子进程退出/debug断点等情况触发，完全属于正常现象。这类不是真正出错的情况不会打印，减少了干扰，提升了服务器的稳定性。
+
+#### get_event_fd(size_t i)/get_events(size_t i):获取事件对应fd和发生事件
+'''
+int Epoller::get_event_fd(size_t i) const { return events_[i].data.fd; }
+uint32_t Epoller::get_events(size_t i) const { return events_[i].events; }
+'''
+用于替代原代码中用于获取有响应事件对应的fd以及监控到发生的事件的逻辑，封装起来可以避免暴露struct epoll_event的内部结构
