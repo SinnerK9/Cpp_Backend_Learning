@@ -1099,4 +1099,148 @@ int Epoller::wait(int timeout_ms) {
 int Epoller::get_event_fd(size_t i) const { return events_[i].data.fd; }
 uint32_t Epoller::get_events(size_t i) const { return events_[i].events; }
 '''
-用于替代原代码中用于获取有响应事件对应的fd以及监控到发生的事件的逻辑，封装起来可以避免暴露struct epoll_event的内部结构
+用于替代原代码中用于获取有响应事件对应的fd以及监控到发生的事件的逻辑，封装起来可以避免暴露struct epoll_event的内部结构。
+
+### HttpConn类
+HttpConn类存储了一个连接的几乎所有信息：客户端是谁，ip地址是多少，对应哪个文件描述符，发送了什么报文存进读缓冲，解析出来要求了什么网页/文件，还是要发送账号密码要求登录；要发送什么响应。
+负责了服务器中几乎所有解析任务：accept得到一个client_fd后进行初始化，得到请求报文后进行解析，查询数据库/发送静态文件，并且发送对应响应，长连接复用。
+可以做一个比喻：在服务器这个商店里，围绕fd这个顾客号，存vcdfwefwf22222222HttpConn。
+
+#### init()方法：用于初始化一个新连接
+从init()方法里可以注意到epoll_ctl()方法，但是没有封装到Epoller，由于m_sockfd和m_addr都是新连接连上后httpconn持有的内容，用static保存epollfd是在httpconn里用epoll_ctl的折衷处理。这个优化解决了原来代码将设置非阻塞和注册epoll交给main和数据httpconn的矛盾。
+'''
+void HttpConn::init(int sockfd, const sockaddr_in& addr) {
+    m_sockfd = sockfd;
+    m_addr   = addr;
+    set_nonblocking(m_sockfd);
+    epoll_ctl(m_epollfd, EPOLL_CTL_ADD, m_sockfd, &ev);
+    reset();
+    m_user_count++;
+}
+'''
+不难发现，init方法和reset方法分开了。reset用于专门解决keep-alive复用，而不是让init大包大揽。
+#### read()方法：循环读
+这个函数的分割是很困难的，在原来的代码架构中，read方法实现的操作是由main来完成的，当时main需要负责将recv到缓冲区中的内容传到users[fd].buffer，但是目前我们把读缓冲区归到了httpconn，意味着main实际上已经不知道读到了什么内容，读报文的任务就交给了httpconn，在此基础上，我们让read方法返回bool，让主线程知道是否读到了数据即可。
+'''
+bool HttpConn::read() {
+    while (true) {
+        char buf[4096];
+        int byte_read = recv(m_sockfd, buf, sizeof(buf) - 1, 0);
+        if (byte_read > 0) {
+            m_read_buf += buf;
+        } else if (byte_read == 0) {
+            return false;  //客户端自己断连了
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return false;  // 错误
+        }
+    }
+    return !m_read_buf.empty();
+}
+'''
+
+#### write()方法：聚合写/适应ET模式
+写的操作和前面的内存映射和确定响应分离开了，并且进行了优化。观察原来的代码，存在一定的缺陷：
+'''
+struct iovec iv[2];
+iv[0].iov_base = (void*)header.c_str();
+iv[0].iov_len = header.size();
+iv[1].iov_base = file_address;
+iv[1].iov_len = file_stat.st_size;
+writev(fd, iv, 2);
+munmap(file_address, file_stat.st_size);
+'''
+在原代码里，writev只会调用一次，而TCP发送缓冲区是有限的，在高并发的情况下很容易填满，这个情况下只调用一次writev返回EAGAIN，数据发不出去，就马上解除内存映射。这会导致客户端接收不到响应或接受不全。并且ET模式只会在状态变化时触发，第一次没发完再也不会有EPOLLOUT事件。缺乏发送状态记录也让断点续传无法实现。优化版本如下：
+'''
+bool HttpConn::write() {
+    if (m_bytes_to_send == 0) return true;
+    while (true) {
+        ssize_t bytes_written = writev(m_sockfd, m_iv, m_iv_count);
+        if (bytes_written > 0) {
+            //循环发送，发多少记多少，自动调整起始为止直到发完
+            m_bytes_have_send += bytes_written;
+            //已经发送的和需要发送的一样多，那就是发完了，解除映射！
+            if (m_bytes_have_send >= m_bytes_to_send) {
+                unmap();
+                return true;
+            }
+            //这意味着发送缓冲区满，遇到EAGAIN了，不销毁数据，不退出不报错，回上一层重新注册等待下一次EPOLLOUT
+        } else if (bytes_written < 0) {
+            if (errno == EAGAIN) return false;  // 没发完
+            unmap();
+            return false;  // 错误
+        }
+    }
+}
+'''
+#### parse_request()/get_line():主从状态机逻辑
+除了起名规范外没有其他改动。
+
+#### 细分响应逻辑
+将handle_client()中的if(GET_REQUEST)情况的各种不同响应方式拆分出来成为多个专门方法。
+>bool check_login(const std::string& user, const std::string& pwd);
+>void make_response(); 
+>void serve_static_file();
+>void send_error(int code, const char* msg);
+>void send_login_response(bool success);
+可以用以下过程描述它们之间的关系：
+make_response()中通过请求报文分析用户需求 --> POST & /login 则为登录需求，解析post_data，查询MySQL数据库，send_login_response() / 不是POST请求？那就发送静态网页，进入serve_static_file()，将响应头写入m_write_buf，对静态html文件进行mmap内存映射。
+对于可能产生不同的错误方式：文件不存在/请求不合格...，调用send_error(code,msg)，填入相应的内容作为响应发送。
+其中还用到parse_post_data(),check_login()等工具函数，没有逻辑变动，不再赘述。
+
+新逻辑：send_error()
+'''
+void HttpConn::send_error(int code, const char* msg) {
+    std::string body = "<html><body><h1>" + std::to_string(code) +
+                       " " + msg + "</h1></body></html>";
+
+    m_write_buf  = "HTTP/1.1 " + std::to_string(code) + " " + msg + "\r\n";
+    m_write_buf += "Content-Type: text/html; charset=utf-8\r\n";
+    m_write_buf += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    m_write_buf += "Connection: close\r\n\r\n";
+    m_write_buf += body;
+
+    //做好发送准备，等待调用write和EPOLLOUT
+    m_iv[0].iov_base = (void*)m_write_buf.data();
+    m_iv[0].iov_len  = m_write_buf.size();
+    m_iv_count       = 1;
+    m_bytes_to_send  = m_write_buf.size();
+    m_bytes_have_send = 0;
+    m_mmap_addr      = nullptr;  //错误响应不使用 mmap
+    m_keep_alive     = false;    //出错直接关闭
+}
+'''
+
+#### process():核心工作流程
+这是handle_client()真正的核心工作部分：
+解析HTTP请求（拿到完整的正确的请求没有？）--> 对各类状态进行相应处理（数据不完整/要求不合格/得到完整请求）：数据不全回去重新注册，重等/要求不合格就send_error() --> make_response()生成响应。
+'''
+void HttpConn::process() {
+    HTTP_CODE code = parse_request();
+    if (code == NO_REQUEST) {
+        // mod EPOLLIN，等更多数据
+        return;
+    }
+    if (code == BAD_REQUEST) {
+        send_error(400, ...);
+        // mod EPOLLOUT //准备好把错误响应发到客户端
+        return;
+    }
+    make_response();
+    // mod EPOLLOUT
+}
+'''
+**这里的一个重要考虑：write是在process里面等着让子线程来操作，还是统一让主线程来调度？**
+
+#### close_conn():统一关闭逻辑
+main函数和handle_client中有大量关闭逻辑，我们统一一个接口，释放mmap。
+void HttpConn::close_conn(bool real_close) {
+    if (real_close && m_sockfd != -1) {
+        epoll_ctl(m_epollfd, EPOLL_CTL_DEL, m_sockfd, nullptr);
+        close(m_sockfd);
+        m_sockfd = -1;
+        m_user_count--;
+    }
+    unmap();  //无论如何都要释放mmap
+}
+
