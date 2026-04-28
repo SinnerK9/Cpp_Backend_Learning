@@ -297,11 +297,9 @@ bool HttpConn::parse_post_data(std::string& user, std::string& pwd) {
 
 //check_login() 数据库验证
 bool HttpConn::check_login(const std::string& user, const std::string& pwd) {
-    MySQLPool* pool = MySQLPool::get_instance();
-    MYSQL* conn = pool->get_conn();
-    if (conn == nullptr) {
-        return false;
-    }
+    ConnGuard guard; //修复:使用Connguard保证连接安全
+    MYSQL* conn = guard.conn();
+    if(!guard) return false; //退出作用域自动析构
 
     char sql[1024];
     snprintf(sql, sizeof(sql),
@@ -309,18 +307,15 @@ bool HttpConn::check_login(const std::string& user, const std::string& pwd) {
              user.c_str(), pwd.c_str());
 
     if (mysql_query(conn, sql)) {
-        pool->return_conn(conn);
-        return false;
+        return false;//析构
     }
 
     MYSQL_RES* res = mysql_store_result(conn);
     bool success = (mysql_num_rows(res) > 0);
-
     mysql_free_result(res);
-    pool->return_conn(conn);
-    return success;
+    return success; //同样析构
 }
-
+//使用连接守卫，保证在每个return离开都会调用return_conn
 
 // make_response() 响应分发器
 void HttpConn::make_response() {
